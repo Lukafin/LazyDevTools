@@ -9,10 +9,11 @@ set -e
 
 # Default values
 BRANCH="develop"
-METHOD="date"
-TAG=""
-START_DATE="2024-11-01"
-END_DATE="2024-11-31"
+METHOD=""
+START_TAG=""
+END_TAG=""
+START_DATE=""
+END_DATE=""
 OUTPUT_FILE="RELEASE_NOTES.md"
 
 # LLM Configuration
@@ -32,10 +33,11 @@ usage() {
     echo "  -m, --method METHOD       Selection method: 'tag' or 'date' (required)"
     echo ""
     echo "Tag-Based Options (use with -m tag):"
-    echo "  -t, --tag TAG             Git tag to compare against (optional; defaults to latest tag)"
+    echo "  -s, --start_tag TAG       Starting Git tag to compare against (optional; defaults to latest tag)"
+    echo "  -T, --end_tag TAG         Ending Git tag to compare up to (optional; defaults to HEAD)"
     echo ""
     echo "Date-Based Options (use with -m date):"
-    echo "  -s, --start_date DATE     Start date (e.g., '2023-01-01')"
+    echo "  -d, --start_date DATE     Start date (e.g., '2023-01-01')"
     echo "  -e, --end_date DATE       End date (e.g., '2023-12-31')"
     echo ""
     echo "Common Options:"
@@ -44,14 +46,14 @@ usage() {
     echo "  -h, --help                Display this help message"
     echo ""
     echo "Examples:"
-    echo "  # Tag-Based (latest tag)"
+    echo "  # Tag-Based (latest tag to HEAD)"
     echo "  $0 -m tag -b main -o RELEASE_NOTES.md"
     echo ""
-    echo "  # Tag-Based (specific tag)"
-    echo "  $0 -m tag -t v2.0.0 -b develop -o DEV_RELEASE_NOTES.md"
+    echo "  # Tag-Based (specific start and end tags)"
+    echo "  $0 -m tag -s v1.0.0 -T v2.0.0 -b develop -o DEV_RELEASE_NOTES.md"
     echo ""
     echo "  # Date-Based"
-    echo "  $0 -m date -s '2023-01-01' -e '2023-12-31' -b main -o RELEASE_NOTES_2023.md"
+    echo "  $0 -m date -d '2023-01-01' -e '2023-12-31' -b main -o RELEASE_NOTES_2023.md"
     exit 1
 }
 
@@ -68,11 +70,15 @@ while [[ "$#" -gt 0 ]]; do
             METHOD="$2"
             shift
             ;;
-        -t|--tag)
-            TAG="$2"
+        -s|--start_tag)
+            START_TAG="$2"
             shift
             ;;
-        -s|--start_date)
+        -T|--end_tag)
+            END_TAG="$2"
+            shift
+            ;;
+        -d|--start_date)
             START_DATE="$2"
             shift
             ;;
@@ -104,7 +110,7 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 # -------------------------------
-# Validate Method
+# Validate Method and Options
 # -------------------------------
 if [[ -z "$METHOD" ]]; then
     echo "Error: Selection method is required."
@@ -123,8 +129,8 @@ if [[ "$METHOD" == "tag" ]]; then
         usage
     fi
 elif [[ "$METHOD" == "date" ]]; then
-    if [[ -n "$TAG" ]]; then
-        echo "Error: Tag option is only valid with 'tag' method."
+    if [[ -n "$START_TAG" || -n "$END_TAG" ]]; then
+        echo "Error: Tag options are only valid with 'tag' method."
         usage
     fi
 
@@ -143,9 +149,9 @@ if ! command -v "$LLM_COMMAND" &> /dev/null; then
 fi
 
 # -------------------------------
-# Fetch the latest commits
+# Fetch the latest commits and tags
 # -------------------------------
-echo "Fetching the latest commits from branch '$BRANCH'..."
+echo "Fetching the latest commits and tags from branch '$BRANCH'..."
 git fetch origin "$BRANCH" --tags
 
 # Check if the branch exists
@@ -155,33 +161,56 @@ if ! git show-ref --verify --quiet "refs/heads/$BRANCH"; then
 fi
 
 # -------------------------------
-# Determine the Reference Point and Get Merge Commits
+# Determine the Reference Points and Get Merge Commits
 # -------------------------------
 MERGE_COMMITS=""
 
 if [[ "$METHOD" == "tag" ]]; then
-    if [[ -n "$TAG" ]]; then
-        echo "Using specified tag '$TAG' as the reference."
-        # Validate the specified tag
-        if ! git rev-parse "$TAG"^{tag} >/dev/null 2>&1; then
-            echo "Error: Tag '$TAG' does not exist."
+    # Handle end_tag
+    if [[ -n "$END_TAG" ]]; then
+        echo "Using specified end tag '$END_TAG'."
+        # Validate end_tag
+        if ! git rev-parse "$END_TAG"^{tag} >/dev/null 2>&1; then
+            echo "Error: End tag '$END_TAG' does not exist."
             exit 1
         fi
-        REFERENCE_COMMIT="$TAG"
     else
         echo "Determining the latest tag on branch '$BRANCH'..."
         LATEST_TAG=$(git describe --tags --abbrev=0 "$BRANCH" 2>/dev/null || true)
         if [[ -z "$LATEST_TAG" ]]; then
-            echo "No tags found on branch '$BRANCH'. Using the initial commit as the reference."
-            REFERENCE_COMMIT=$(git rev-list --max-parents=0 origin/"$BRANCH")
+            echo "No tags found on branch '$BRANCH'. Using the initial commit as the end reference."
+            END_TAG=$(git rev-list --max-parents=0 origin/"$BRANCH")
         else
             echo "Latest tag on branch '$BRANCH' is '$LATEST_TAG'."
-            REFERENCE_COMMIT="$LATEST_TAG"
+            END_TAG="$LATEST_TAG"
         fi
     fi
 
-    echo "Retrieving merge commits on branch '$BRANCH' since '$REFERENCE_COMMIT'..."
-    MERGE_COMMITS=$(git log "$REFERENCE_COMMIT"..origin/"$BRANCH" --merges --pretty=format:"- %s")
+    # Handle start_tag
+    if [[ -n "$START_TAG" ]]; then
+        echo "Using specified start tag '$START_TAG' as the reference."
+        # Validate start_tag
+        if ! git rev-parse "$START_TAG"^{tag} >/dev/null 2>&1; then
+            echo "Error: Start tag '$START_TAG' does not exist."
+            exit 1
+        fi
+        REFERENCE_COMMIT="$START_TAG"
+    else
+        # Determine the previous tag before end_tag
+        echo "Determining the previous tag before '$END_TAG'..."
+        PREV_TAG=$(git describe --tags --abbrev=0 "$END_TAG"^ 2>/dev/null || true)
+        if [[ -z "$PREV_TAG" ]]; then
+            echo "No previous tags found before '$END_TAG'. Using the initial commit as the reference."
+            REFERENCE_COMMIT=$(git rev-list --max-parents=0 origin/"$BRANCH")
+        else
+            echo "Previous tag is '$PREV_TAG'."
+            REFERENCE_COMMIT="$PREV_TAG"
+        fi
+    fi
+
+    echo "Retrieving merge commits on branch '$BRANCH' from '$REFERENCE_COMMIT' to '$END_TAG'..."
+    MERGE_COMMITS=$(git log "$REFERENCE_COMMIT".."$END_TAG" --merges --pretty=format:"- %s")
+
 elif [[ "$METHOD" == "date" ]]; then
     echo "Retrieving merge commits on branch '$BRANCH' based on date range..."
 
