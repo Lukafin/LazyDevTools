@@ -9,7 +9,10 @@ set -e
 
 # Default values
 BRANCH="develop"
-NUM_MERGES=10
+METHOD="date"
+TAG=""
+START_DATE="2024-11-01"
+END_DATE="2024-11-31"
 OUTPUT_FILE="RELEASE_NOTES.md"
 
 # LLM Configuration
@@ -20,29 +23,65 @@ LLM_COMMAND="llm"              # Command to invoke the LLM
 # Function to display usage information
 # -------------------------------
 usage() {
-    echo "Usage: $0 [-b branch] [-n number_of_merges] [-o output_file]"
-    echo "  -b, --branch           The target branch to generate release notes for (default: main)"
-    echo "  -n, --number           The number of last merge commits to include (default: 10)"
-    echo "  -o, --output           The output file for release notes (default: RELEASE_NOTES.md)"
-    echo "  -h, --help             Display this help message"
+    echo "Usage: $0 -m METHOD [OPTIONS]"
+
+    echo ""
+    echo "Generate release notes based on Git merge commits using either tag-based or date-based selection."
+    echo ""
+    echo "Methods:"
+    echo "  -m, --method METHOD       Selection method: 'tag' or 'date' (required)"
+    echo ""
+    echo "Tag-Based Options (use with -m tag):"
+    echo "  -t, --tag TAG             Git tag to compare against (optional; defaults to latest tag)"
+    echo ""
+    echo "Date-Based Options (use with -m date):"
+    echo "  -s, --start_date DATE     Start date (e.g., '2023-01-01')"
+    echo "  -e, --end_date DATE       End date (e.g., '2023-12-31')"
+    echo ""
+    echo "Common Options:"
+    echo "  -b, --branch BRANCH       Target branch (default: main)"
+    echo "  -o, --output FILE         Output file for release notes (default: RELEASE_NOTES.md)"
+    echo "  -h, --help                Display this help message"
+    echo ""
+    echo "Examples:"
+    echo "  # Tag-Based (latest tag)"
+    echo "  $0 -m tag -b main -o RELEASE_NOTES.md"
+    echo ""
+    echo "  # Tag-Based (specific tag)"
+    echo "  $0 -m tag -t v2.0.0 -b develop -o DEV_RELEASE_NOTES.md"
+    echo ""
+    echo "  # Date-Based"
+    echo "  $0 -m date -s '2023-01-01' -e '2023-12-31' -b main -o RELEASE_NOTES_2023.md"
     exit 1
 }
 
 # -------------------------------
 # Parse command-line arguments
 # -------------------------------
+if [[ "$#" -eq 0 ]]; then
+    usage
+fi
+
 while [[ "$#" -gt 0 ]]; do
     case $1 in
-        -b|--branch)
-            BRANCH="$2"
+        -m|--method)
+            METHOD="$2"
             shift
             ;;
-        -n|--number)
-            if ! [[ "$2" =~ ^[0-9]+$ ]]; then
-                echo "Error: Number of merges must be a positive integer."
-                usage
-            fi
-            NUM_MERGES="$2"
+        -t|--tag)
+            TAG="$2"
+            shift
+            ;;
+        -s|--start_date)
+            START_DATE="$2"
+            shift
+            ;;
+        -e|--end_date)
+            END_DATE="$2"
+            shift
+            ;;
+        -b|--branch)
+            BRANCH="$2"
             shift
             ;;
         -o|--output)
@@ -65,6 +104,37 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 # -------------------------------
+# Validate Method
+# -------------------------------
+if [[ -z "$METHOD" ]]; then
+    echo "Error: Selection method is required."
+    usage
+fi
+
+if [[ "$METHOD" != "tag" && "$METHOD" != "date" ]]; then
+    echo "Error: Invalid method '$METHOD'. Choose 'tag' or 'date'."
+    usage
+fi
+
+# Validate mutually exclusive options
+if [[ "$METHOD" == "tag" ]]; then
+    if [[ -n "$START_DATE" || -n "$END_DATE" ]]; then
+        echo "Error: Start date and end date options are only valid with 'date' method."
+        usage
+    fi
+elif [[ "$METHOD" == "date" ]]; then
+    if [[ -n "$TAG" ]]; then
+        echo "Error: Tag option is only valid with 'tag' method."
+        usage
+    fi
+
+    if [[ -z "$START_DATE" && -z "$END_DATE" ]]; then
+        echo "Error: At least one of start date or end date must be specified for 'date' method."
+        usage
+    fi
+fi
+
+# -------------------------------
 # Verify LLM Command Exists
 # -------------------------------
 if ! command -v "$LLM_COMMAND" &> /dev/null; then
@@ -76,7 +146,7 @@ fi
 # Fetch the latest commits
 # -------------------------------
 echo "Fetching the latest commits from branch '$BRANCH'..."
-git fetch origin "$BRANCH"
+git fetch origin "$BRANCH" --tags
 
 # Check if the branch exists
 if ! git show-ref --verify --quiet "refs/heads/$BRANCH"; then
@@ -85,14 +155,51 @@ if ! git show-ref --verify --quiet "refs/heads/$BRANCH"; then
 fi
 
 # -------------------------------
-# Get the last N merge commits
+# Determine the Reference Point and Get Merge Commits
 # -------------------------------
-echo "Retrieving the last $NUM_MERGES merge commits from branch '$BRANCH'..."
-MERGE_COMMITS=$(git log "$BRANCH" --merges -n "$NUM_MERGES" --pretty=format:"- %s")
+MERGE_COMMITS=""
+
+if [[ "$METHOD" == "tag" ]]; then
+    if [[ -n "$TAG" ]]; then
+        echo "Using specified tag '$TAG' as the reference."
+        # Validate the specified tag
+        if ! git rev-parse "$TAG"^{tag} >/dev/null 2>&1; then
+            echo "Error: Tag '$TAG' does not exist."
+            exit 1
+        fi
+        REFERENCE_COMMIT="$TAG"
+    else
+        echo "Determining the latest tag on branch '$BRANCH'..."
+        LATEST_TAG=$(git describe --tags --abbrev=0 "$BRANCH" 2>/dev/null || true)
+        if [[ -z "$LATEST_TAG" ]]; then
+            echo "No tags found on branch '$BRANCH'. Using the initial commit as the reference."
+            REFERENCE_COMMIT=$(git rev-list --max-parents=0 origin/"$BRANCH")
+        else
+            echo "Latest tag on branch '$BRANCH' is '$LATEST_TAG'."
+            REFERENCE_COMMIT="$LATEST_TAG"
+        fi
+    fi
+
+    echo "Retrieving merge commits on branch '$BRANCH' since '$REFERENCE_COMMIT'..."
+    MERGE_COMMITS=$(git log "$REFERENCE_COMMIT"..origin/"$BRANCH" --merges --pretty=format:"- %s")
+elif [[ "$METHOD" == "date" ]]; then
+    echo "Retrieving merge commits on branch '$BRANCH' based on date range..."
+
+    if [[ -n "$START_DATE" && -n "$END_DATE" ]]; then
+        echo "From '$START_DATE' to '$END_DATE'."
+        MERGE_COMMITS=$(git log origin/"$BRANCH" --merges --since="$START_DATE" --until="$END_DATE" --pretty=format:"- %s")
+    elif [[ -n "$START_DATE" ]]; then
+        echo "Since '$START_DATE'."
+        MERGE_COMMITS=$(git log origin/"$BRANCH" --merges --since="$START_DATE" --pretty=format:"- %s")
+    elif [[ -n "$END_DATE" ]]; then
+        echo "Up to '$END_DATE'."
+        MERGE_COMMITS=$(git log origin/"$BRANCH" --merges --until="$END_DATE" --pretty=format:"- %s")
+    fi
+fi
 
 # Check if there are any merge commits
-if [ -z "$MERGE_COMMITS" ]; then
-    echo "No merge commits found on branch '$BRANCH'."
+if [[ -z "$MERGE_COMMITS" ]]; then
+    echo "No merge commits found on branch '$BRANCH' with the specified criteria."
     exit 0
 fi
 
@@ -118,7 +225,7 @@ RELEASE_NOTES=$("$LLM_COMMAND" -m "$LLM_MODEL" "$PROMPT")
 # -------------------------------
 # Validate LLM Response
 # -------------------------------
-if [ -z "$RELEASE_NOTES" ] || [ "$RELEASE_NOTES" == "null" ]; then
+if [[ -z "$RELEASE_NOTES" || "$RELEASE_NOTES" == "null" ]]; then
     echo "Error: Failed to retrieve release notes from the LLM."
     exit 1
 fi
